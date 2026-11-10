@@ -1,0 +1,27 @@
+# Hasil build — jangan di-commit, build ulang dari source.
+*.exe
+ssh-terminal
+*.out
+*.test
+
+# Log debug lokal (isinya host/user/tahap koneksi, bukan password,
+# tapi tetap tidak perlu masuk repo).
+*.log
+
+# File sementara / artefak lokal.
+.DS_Store
+Thumbs.db
+
+# Sesi dan host key pemakai TIDAK ada di folder source ini
+# (tersimpan di %APPDATA%\SSHTerminal\), tapi kalau suatu saat ada
+# salinannya di sini, jangan di-commit.
+sessions.json
+known_hosts.txt
+*.ppk
+*.pem
+*.key
+id_ed25519
+id_rsa
+
+#semua file sisa
+BACKUP-INFO.md
