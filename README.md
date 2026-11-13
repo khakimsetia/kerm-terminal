@@ -32,7 +32,7 @@ Satu file `.exe`, portable: extract lalu jalankan.
   jendela terminal. Tutup panel saat terminal jalan hanya menyembunyikan
   panel; tutup satu terminal menampilkan panel lagi, terminal lain tetap jalan.
 - **Terminal lengkap untuk pemakaian sehari-hari**: warna PuTTY, layar
-  alternatif (vim, nano, htop, tmux), scrollback 2000 baris, scroll dengan
+  alternatif (vim, nano, htop, tmux), scrollback tanpa batas, scroll dengan
   roda mouse / Shift+PgUp / Shift+PgDn / Shift+Home / Shift+End, seleksi
   mouse + auto-copy saat lepas klik, copy Ctrl+Shift+C, paste Ctrl+V,
   klik kanan untuk copy/paste, tombol dan mouse xterm (termasuk F5–F12,

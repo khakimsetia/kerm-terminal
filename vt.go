@@ -319,15 +319,9 @@ func (t *Term) scrollUp(n int) {
 	for i := 0; i < n; i++ {
 		if !t.altActive && t.top == 0 && t.bottom == t.Rows-1 {
 			t.scrollback = append(t.scrollback, append([]Cell{}, buf[0]...))
-			if len(t.scrollback) > 2000 {
-				t.scrollback = t.scrollback[len(t.scrollback)-2000:]
-			}
 		}
 		copy(buf[t.top:t.bottom], buf[t.top+1:t.bottom+1])
 		buf[t.bottom] = blankLine(t.Cols)
-		// Baris logis yang terpotong ikut bergeser ke atas bersama
-		// buffer; kalau baris pertamanya keluar dari region (scroll
-		// off), pelacakan wrap tidak lagi valid.
 		if t.wrapStartY >= t.top && t.wrapStartY <= t.bottom {
 			t.wrapStartY--
 			if t.wrapStartY < t.top {
