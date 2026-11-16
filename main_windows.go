@@ -802,13 +802,19 @@ func updateTermScrollbar(t *termWin) {
 	if pos > sb {
 		pos = sb
 	}
+	// Jarak gerak thumb diskalakan via scrollbarRange (scroll.go):
+	// untuk sb <= 65535 hasilnya persis seperti dulu
+	// (NMax = sb+rows-1, NPage = rows, NPos = pos); untuk sb yang
+	// lebih besar jarak geraknya 0..65535 supaya posisi thumb di
+	// wParam WM_VSCROLL (16 bit) tetap bermakna.
+	travelMax, page := scrollbarRange(sb, rows)
 	si := win.SCROLLINFO{
 		CbSize: uint32(unsafe.Sizeof(win.SCROLLINFO{})),
 		FMask:  win.SIF_RANGE | win.SIF_PAGE | win.SIF_POS | win.SIF_DISABLENOSCROLL,
 		NMin:   0,
-		NMax:   int32(sb + rows - 1),
-		NPage:  uint32(rows),
-		NPos:   int32(pos),
+		NMax:   int32(travelMax + page - 1),
+		NPage:  uint32(page),
+		NPos:   int32(scrollPosToThumbPos(sb, rows, pos)),
 	}
 	win.SetScrollInfo(t.hwnd, win.SB_VERT, &si, true)
 }
@@ -2320,7 +2326,6 @@ func termWndProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr) uintptr {
 			return 0
 		}
 		code := int(wParam & 0xFFFF)
-		thumbPos := int(int16((wParam >> 16) & 0xFFFF))
 		switch code {
 		case win.SB_LINEUP:
 			setScrollOffset(t, t.scrollOffset+1)
@@ -2331,7 +2336,23 @@ func termWndProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr) uintptr {
 		case win.SB_PAGEDOWN:
 			setScrollOffset(t, t.scrollOffset-t.term.Rows)
 		case win.SB_THUMBTRACK, win.SB_THUMBPOSITION:
-			setScrollOffset(t, t.term.ScrollbackLen()-thumbPos)
+			// Posisi thumb HANYA dari high word wParam pesan ini
+			// (uint16, bukan int16 — int16 membungkus nilai
+			// >32767 jadi negatif, itu bug 2026-11-13 yang
+			// pertama). Dua percobaan sebelumnya mengandalkan
+			// GetScrollInfo (NTrackPos saat drag, SIF_POS saat
+			// lepas) dan thumb tetap kembali ke atas, jadi
+			// GetScrollInfo tidak dipakai lagi di sini sama
+			// sekali. Supaya posisi 16-bit ini tetap bermakna
+			// untuk scrollback sebesar apa pun, jarak gerak
+			// thumb diskalakan ke <= 65535 di scrollbarRange
+			// (scroll.go); updateTermScrollbar memakai
+			// penskalaan yang sama, jadi drag dan lepas thumb
+			// selalu mendarat di tempat mouse berada.
+			sb := t.term.ScrollbackLen()
+			thumbPos := int((wParam >> 16) & 0xFFFF)
+			pos := scrollThumbPosToPos(sb, t.term.Rows, thumbPos)
+			setScrollOffset(t, scrollOffsetFromThumbPos(sb, pos))
 		case win.SB_TOP:
 			setScrollOffset(t, t.term.ScrollbackLen())
 		case win.SB_BOTTOM:
@@ -2653,6 +2674,20 @@ func main() {
 		LpszClassName: utf16("SSHTermPick"),
 	}
 	win.RegisterClassEx(&pickClass)
+	// Overwrite dialog class (SFTP, gaya WinSCP: Yes / Yes to All /
+	// No / No to All / Cancel). Dialog modal, kelas sendiri.
+	overwriteClass := win.WNDCLASSEX{
+		CbSize:        uint32(unsafe.Sizeof(win.WNDCLASSEX{})),
+		Style:         win.CS_HREDRAW | win.CS_VREDRAW,
+		LpfnWndProc:   overwriteProc,
+		HInstance:     hInst,
+		HIcon:         appIcon,
+		HIconSm:       appIconSm,
+		HCursor:       win.LoadCursor(0, win.MAKEINTRESOURCE(win.IDC_ARROW)),
+		HbrBackground: sessionBgBrush,
+		LpszClassName: utf16("SSHTermOverwrite"),
+	}
+	win.RegisterClassEx(&overwriteClass)
 
 	hwndSession = win.CreateWindowEx(0, utf16("SSHTermSession"), utf16("Kerm - SSH & Telnet terminal"),
 		win.WS_OVERLAPPEDWINDOW, win.CW_USEDEFAULT, win.CW_USEDEFAULT, 580, 700,

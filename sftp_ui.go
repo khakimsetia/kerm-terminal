@@ -25,8 +25,14 @@
 // jadi jendela tidak freeze saat upload/download.
 //
 // v1: satu file sekali, direktori hanya untuk navigasi (bukan
-// transfer rekursif). Tutup jendela SFTP tidak menutup terminal;
-// tutup/putus terminal menutup jendela SFTP-nya.
+// transfer rekursif). v2 (2026-11-16): multi-select (Shift+klik,
+// Ctrl+klik, Ctrl+A) + transfer batch multi-file + folder rekursif
+// (upload maupun download), dialog timpa gaya WinSCP per file
+// (Yes / Yes to All / No / No to All / Cancel, tanpa Newer only),
+// dan multi-delete (Delete / klik kanan Delete menghapus semua yang
+// terpilih, satu dialog konfirmasi).
+// Tutup jendela SFTP tidak menutup terminal; tutup/putus terminal
+// menutup jendela SFTP-nya.
 package main
 
 import (
@@ -66,6 +72,7 @@ const (
 	sftpIdProgress
 	sftpIdProgressLabel
 	sftpIdStatus
+	sftpIdLocalBrowse // tombol 📁 Browse di panel lokal (pilih folder)
 )
 
 const (
@@ -76,6 +83,7 @@ const (
 	wmAppSFTPDblClk   = win.WM_APP + 14
 	wmAppSFTPOpDone   = win.WM_APP + 16
 	wmAppSFTPDeleteKey = win.WM_APP + 17
+	wmAppSFTPItem     = win.WM_APP + 19 // goroutine transfer: file ke-i mulai (wParam = index 1-based)
 )
 
 const (
@@ -110,6 +118,12 @@ type sftpWin struct {
 	cancel         atomic.Bool
 	transferName   string
 	transferDir    string // "upload" atau "download"
+	// Antrean batch (2026-11-16): multi-file + folder. Diisi UI
+	// thread sebelum goroutine transfer jalan, lalu hanya dibaca —
+	// jadi aman dibaca goroutine transfer dan UI thread sekaligus.
+	transferItems []transferItem
+	transferIndex int // 1-based, file yang sedang ditransfer
+	transferTotal int
 	progressSent   atomic.Int64
 	progressTotal  atomic.Int64
 	lastProgressPost time.Time
@@ -144,6 +158,15 @@ type sftpDoneResult struct {
 	name string
 	dir  string
 	err  error
+	// Ringkasan batch (2026-11-16): total file antrean, berapa
+	// berhasil, berapa gagal. Untuk transfer satu file nilainya
+	// total=1, okCount=1/0, failedCount=0/1 — handler lama tetap jalan.
+	total       int
+	okCount     int
+	failedCount int
+	// failures: pesan "display: error" per file yang gagal (termasuk
+	// folder yang gagal dibuat), dilog handler Done di UI thread.
+	failures []string
 }
 
 type sftpOpResult struct {
@@ -565,6 +588,30 @@ func listSelection(list win.HWND, entries []SFTPEntry) *SFTPEntry {
 	return &e
 }
 
+// listSelections: SEMUA item yang terpilih, urut sesuai tampilannya.
+// Dipakai Upload/Download multi-file (2026-11-16). ListView tanpa
+// LVS_SINGLESEL: Shift+klik = rentang, Ctrl+klik = tambah/lepas.
+func listSelections(list win.HWND, entries []SFTPEntry) []SFTPEntry {
+	var out []SFTPEntry
+	idx := -1
+	for {
+		idx = int(win.SendMessage(list, win.LVM_GETNEXTITEM, uintptr(idx), uintptr(win.LVNI_SELECTED)))
+		if idx < 0 || idx >= len(entries) {
+			break
+		}
+		out = append(out, entries[idx])
+	}
+	return out
+}
+
+func (w *sftpWin) localSelections() []SFTPEntry {
+	return listSelections(w.ctlLocalList, w.localEntries)
+}
+
+func (w *sftpWin) remoteSelections() []SFTPEntry {
+	return listSelections(w.ctlRemoteList, w.remoteEntries)
+}
+
 func (w *sftpWin) localSelection() *SFTPEntry {
 	return listSelection(w.ctlLocalList, w.localEntries)
 }
@@ -598,21 +645,47 @@ func layoutSFTP(w *sftpWin) {
 	panelW := (cw - 32 - 128) / 2
 	leftX := int32(16)
 	rightX := leftX + panelW + 128
-	// Baris path (y=72): edit + Up (50) + Refresh (64), per panel.
+	// Baris path (y=72): edit + tombol, per panel. Lokal: Up (50) +
+	// Refresh (64) + Browse (96, pilih folder). Remote: Up + Refresh
+	// saja. Tombol berakhir rapat di tepi kanan panel (seperti dulu).
 	for _, p := range []struct {
-		edit, up, refresh win.HWND
-		x                  int32
+		edit    win.HWND
+		buttons []struct {
+			hwnd win.HWND
+			w    int32
+		}
+		x int32
 	}{
-		{w.ctlLocalPath, win.GetDlgItem(w.hwnd, sftpIdLocalUp), win.GetDlgItem(w.hwnd, sftpIdLocalRefresh), leftX},
-		{w.ctlRemotePath, win.GetDlgItem(w.hwnd, sftpIdRemoteUp), win.GetDlgItem(w.hwnd, sftpIdRemoteRefresh), rightX},
+		{w.ctlLocalPath, []struct {
+			hwnd win.HWND
+			w    int32
+		}{
+			{win.GetDlgItem(w.hwnd, sftpIdLocalUp), 50},
+			{win.GetDlgItem(w.hwnd, sftpIdLocalRefresh), 64},
+			{win.GetDlgItem(w.hwnd, sftpIdLocalBrowse), 96},
+		}, leftX},
+		{w.ctlRemotePath, []struct {
+			hwnd win.HWND
+			w    int32
+		}{
+			{win.GetDlgItem(w.hwnd, sftpIdRemoteUp), 50},
+			{win.GetDlgItem(w.hwnd, sftpIdRemoteRefresh), 64},
+		}, rightX},
 	} {
-		editW := panelW - 50 - 64 - 16
+		totalBtnW := int32(0)
+		for _, b := range p.buttons {
+			totalBtnW += b.w + 8
+		}
+		editW := panelW - totalBtnW
 		if editW < 100 {
 			editW = 100
 		}
 		win.MoveWindow(p.edit, p.x, 72, editW, 22, true)
-		win.MoveWindow(p.up, p.x+editW+8, 72, 50, 24, true)
-		win.MoveWindow(p.refresh, p.x+editW+66, 72, 64, 24, true)
+		bx := p.x + editW + 8
+		for _, b := range p.buttons {
+			win.MoveWindow(b.hwnd, bx, 72, b.w, 24, true)
+			bx += b.w + 8
+		}
 	}
 	// Daftar: y=104 sampai atas area progress (ch-140).
 	listTop := int32(104)
@@ -670,90 +743,277 @@ func browseLocalFile(owner win.HWND, startDir string) string {
 	return ""
 }
 
-// askOverwrite: dialog timpa dengan detail ukuran + tanggal kedua
-// sisi. True = timpa, false = lewati/batal. Dipanggil dari UI thread.
-func askOverwrite(owner win.HWND, name, target string, existingSize int64, existingTime time.Time, newSize int64, newTime time.Time) bool {
-	text := fmt.Sprintf("File already exists:\n%s\n\nExisting: %s, %s\nNew: %s, %s\n\nOverwrite?",
-		target, formatSize(existingSize), existingTime.Format("2006-01-02 15:04"),
-		formatSize(newSize), newTime.Format("2006-01-02 15:04"))
-	return msgBox(owner, text, "Overwrite?", win.MB_YESNO|win.MB_ICONQUESTION) == win.IDYES
+// uploadItemsForSelection: kembangkan seleksi lokal menjadi antrean
+// file. File = satu item; folder = semua isinya secara rekursif
+// (collectLocalFiles), struktur folder dipertahankan. ".." dilewati.
+// Folder yang gagal dibaca dilog lalu dilewati, folder lain tetap jalan.
+func (w *sftpWin) uploadItemsForSelection(sels []SFTPEntry) (items []transferItem, dirs []string) {
+	for _, sel := range sels {
+		if sel.IsParent {
+			continue
+		}
+		if sel.IsDir {
+			sub, subDirs, err := collectLocalFiles(localJoin(w.localPath, sel.Name), remoteJoin(w.remotePath, sel.Name))
+			if err != nil {
+				w.appendLog("Upload skipped folder " + sel.Name + ": " + err.Error())
+				continue
+			}
+			if len(sub) == 0 {
+				// Folder kosong: tetap dibuat di server.
+				dirs = append(dirs, remoteJoin(w.remotePath, sel.Name))
+			}
+			items = append(items, sub...)
+			dirs = append(dirs, subDirs...)
+			continue
+		}
+		localPath := localJoin(w.localPath, sel.Name)
+		var size int64
+		var modTime time.Time
+		if info, err := os.Stat(localPath); err == nil {
+			size = info.Size()
+			modTime = info.ModTime()
+		}
+		items = append(items, transferItem{localPath: localPath, remotePath: remoteJoin(w.remotePath, sel.Name), display: sel.Name, size: size, srcModTime: modTime})
+	}
+	return items, dirs
+}
+
+// downloadItemsForSelection: cerminan uploadItemsForSelection untuk
+// panel remote. Folder = semua isinya secara rekursif.
+func (w *sftpWin) downloadItemsForSelection(sels []SFTPEntry) (items []transferItem, dirs []string) {
+	for _, sel := range sels {
+		if sel.IsParent {
+			continue
+		}
+		if sel.IsDir {
+			sub, subDirs, err := collectRemoteFiles(w.client, remoteJoin(w.remotePath, sel.Name), localJoin(w.localPath, sel.Name))
+			if err != nil {
+				w.appendLog("Download skipped folder " + sel.Name + ": " + err.Error())
+				continue
+			}
+			if len(sub) == 0 {
+				dirs = append(dirs, localJoin(w.localPath, sel.Name))
+			}
+			items = append(items, sub...)
+			dirs = append(dirs, subDirs...)
+			continue
+		}
+		items = append(items, transferItem{localPath: localJoin(w.localPath, sel.Name), remotePath: remoteJoin(w.remotePath, sel.Name), display: sel.Name, size: sel.Size, srcModTime: sel.ModTime})
+	}
+	return items, dirs
+}
+
+// confirmBatchOverwrite: dialog timpa gaya WinSCP (2026-11-16).
+// Cek mana dari antrean yang sudah ada di tujuan (Stat per file, di
+// UI thread — satu round-trip per file, cepat dalam kondisi normal),
+// lalu tanya dialog PER FILE yang sudah ada: Yes (timpa file ini),
+// No (lewati file ini), Yes to All (timpa file ini + semua berikut),
+// No to All (lewati semua berikut), Cancel (batalkan seluruh
+// transfer). Logika "to All"-nya ada di applyOverwriteDecisions
+// (sftp.go, ter-test); dialog Win32-nya di sftp_overwrite.go.
+// Dialog ditanya di muka, SEBELUM transfer jalan — jadi transfer
+// tidak pernah berhenti di tengah jalan menunggu jawaban. Kembalikan
+// antrean final + true kalau ada yang jalan.
+func (w *sftpWin) confirmBatchOverwrite(dir string, items []transferItem) ([]transferItem, bool) {
+	existing := make([]bool, len(items))
+	// Info file tujuan (sisi "Existing" dialog), supaya tidak Stat
+	// dua kali untuk file yang sama.
+	type existInfo struct {
+		size    int64
+		modTime time.Time
+	}
+	exMap := make(map[string]existInfo, len(items))
+	anyExisting := false
+	for i, it := range items {
+		if dir == "upload" {
+			if fi, err := w.client.Stat(it.remotePath); err == nil {
+				existing[i] = true
+				exMap[it.localPath+"|"+it.remotePath] = existInfo{size: fi.Size(), modTime: fi.ModTime()}
+				anyExisting = true
+			}
+		} else {
+			if fi, err := os.Stat(it.localPath); err == nil {
+				existing[i] = true
+				exMap[it.localPath+"|"+it.remotePath] = existInfo{size: fi.Size(), modTime: fi.ModTime()}
+				anyExisting = true
+			}
+		}
+	}
+	if !anyExisting {
+		return items, true
+	}
+	ask := func(it transferItem) overwriteDecision {
+		ex := exMap[it.localPath+"|"+it.remotePath]
+		target := it.remotePath
+		if dir == "download" {
+			target = it.localPath
+		}
+		return askOverwriteWinSCP(w.hwnd, it.display, target, ex.size, ex.modTime, it.size, it.srcModTime)
+	}
+	kept, ok := applyOverwriteDecisions(items, existing, ask)
+	if !ok {
+		w.appendLog("Cancelled.")
+		return nil, false
+	}
+	if len(kept) == 0 {
+		w.appendLog("Skipped all files.")
+	}
+	return kept, true
 }
 
 func (w *sftpWin) startUpload() {
 	if !w.ready || w.client == nil || w.transferInProg {
 		return
 	}
-	var localPath, name string
-	if sel := w.localSelection(); sel != nil {
-		if sel.IsParent {
+	sels := w.localSelections()
+	if len(sels) > 0 {
+		onlyParent := true
+		for _, s := range sels {
+			if !s.IsParent {
+				onlyParent = false
+			}
+		}
+		if onlyParent {
 			msgBox(w.hwnd, "Parent directory (..) cannot be transferred. Double-click it to go up.", "SFTP", win.MB_ICONWARNING|win.MB_OK)
 			return
 		}
-		if sel.IsDir {
-			msgBox(w.hwnd, "Directories are not supported in SFTP v1. Please select a file.", "SFTP", win.MB_ICONWARNING|win.MB_OK)
-			return
-		}
-		localPath = localJoin(w.localPath, sel.Name)
-		name = sel.Name
-	} else {
+	}
+	if len(sels) == 0 {
+		// Tanpa seleksi: dialog pilih file seperti dulu (satu file).
 		picked := browseLocalFile(w.hwnd, w.localPath)
 		if picked == "" {
 			return
 		}
-		localPath = picked
-		name = filepath.Base(picked)
+		name := filepath.Base(picked)
+		info, err := os.Stat(picked)
+		if err != nil {
+			w.appendLog("Upload failed: " + err.Error())
+			return
+		}
+		item := transferItem{localPath: picked, remotePath: remoteJoin(w.remotePath, name), display: name, size: info.Size(), srcModTime: info.ModTime()}
+		items, ok := w.confirmBatchOverwrite("upload", []transferItem{item})
+		if !ok {
+			return
+		}
+		w.startTransferBatch("upload", items, nil)
+		return
 	}
-	remotePath := remoteJoin(w.remotePath, name)
+	items, dirs := w.uploadItemsForSelection(sels)
+	if len(items) == 0 && len(dirs) == 0 {
+		msgBox(w.hwnd, "Nothing to upload. Select files or folders in the local panel first.", "SFTP", win.MB_ICONWARNING|win.MB_OK)
+		return
+	}
+	items, ok := w.confirmBatchOverwrite("upload", items)
+	if !ok {
+		return
+	}
+	w.startTransferBatch("upload", items, dirs)
+}
+
+// startUploadOne: satu file (dipakai double-click / Enter di panel
+// lokal). Dialog timpa gaya WinSCP yang sama (Yes / Yes to All /
+// No / No to All / Cancel); untuk satu file, "to All" sama artinya
+// dengan Yes/No biasa, Cancel = lewati file ini.
+func (w *sftpWin) startUploadOne(sel SFTPEntry) {
+	if !w.ready || w.client == nil || w.transferInProg {
+		return
+	}
+	if sel.IsParent || sel.IsDir {
+		return
+	}
+	localPath := localJoin(w.localPath, sel.Name)
+	remotePath := remoteJoin(w.remotePath, sel.Name)
 	info, err := os.Stat(localPath)
 	if err != nil {
 		w.appendLog("Upload failed: " + err.Error())
 		return
 	}
-	overwrite := true
 	if existing, err := w.client.Stat(remotePath); err == nil {
-		overwrite = askOverwrite(w.hwnd, name, remotePath, existing.Size(), existing.ModTime(), info.Size(), info.ModTime())
-		if !overwrite {
-			w.appendLog("Skipped: " + name)
+		ans := askOverwriteWinSCP(w.hwnd, sel.Name, remotePath, existing.Size(), existing.ModTime(), info.Size(), info.ModTime())
+		if ans == overwriteNo || ans == overwriteNoAll || ans == overwriteCancel {
+			w.appendLog("Skipped: " + sel.Name)
 			return
 		}
 	}
-	w.startTransfer("upload", name, localPath, remotePath, overwrite)
+	w.startTransferBatch("upload", []transferItem{{localPath: localPath, remotePath: remotePath, display: sel.Name, size: info.Size(), srcModTime: info.ModTime()}}, nil)
 }
 
 func (w *sftpWin) startDownload() {
 	if !w.ready || w.client == nil || w.transferInProg {
 		return
 	}
-	sel := w.remoteSelection()
-	if sel == nil {
-		msgBox(w.hwnd, "Please select a file in the remote panel first.", "SFTP", win.MB_ICONWARNING|win.MB_OK)
+	sels := w.remoteSelections()
+	if len(sels) > 0 {
+		onlyParent := true
+		for _, s := range sels {
+			if !s.IsParent {
+				onlyParent = false
+			}
+		}
+		if onlyParent {
+			msgBox(w.hwnd, "Parent directory (..) cannot be transferred. Double-click it to go up.", "SFTP", win.MB_ICONWARNING|win.MB_OK)
+			return
+		}
+	}
+	if len(sels) == 0 {
+		msgBox(w.hwnd, "Please select files or folders in the remote panel first.", "SFTP", win.MB_ICONWARNING|win.MB_OK)
 		return
 	}
-	if sel.IsParent {
-		msgBox(w.hwnd, "Parent directory (..) cannot be transferred. Double-click it to go up.", "SFTP", win.MB_ICONWARNING|win.MB_OK)
+	items, dirs := w.downloadItemsForSelection(sels)
+	if len(items) == 0 && len(dirs) == 0 {
+		msgBox(w.hwnd, "Nothing to download. Select files or folders in the remote panel first.", "SFTP", win.MB_ICONWARNING|win.MB_OK)
 		return
 	}
-	if sel.IsDir {
-		msgBox(w.hwnd, "Directories are not supported in SFTP v1. Please select a file.", "SFTP", win.MB_ICONWARNING|win.MB_OK)
+	items, ok := w.confirmBatchOverwrite("download", items)
+	if !ok {
+		return
+	}
+	w.startTransferBatch("download", items, dirs)
+}
+
+// startDownloadOne: satu file (dipakai double-click / Enter file biner
+// di panel remote). Dialog timpa gaya WinSCP yang sama seperti batch.
+func (w *sftpWin) startDownloadOne(sel SFTPEntry) {
+	if !w.ready || w.client == nil || w.transferInProg {
+		return
+	}
+	if sel.IsParent || sel.IsDir {
 		return
 	}
 	remotePath := remoteJoin(w.remotePath, sel.Name)
 	localPath := localJoin(w.localPath, sel.Name)
-	overwrite := true
 	if existing, err := os.Stat(localPath); err == nil {
-		overwrite = askOverwrite(w.hwnd, sel.Name, localPath, existing.Size(), existing.ModTime(), sel.Size, sel.ModTime)
-		if !overwrite {
+		ans := askOverwriteWinSCP(w.hwnd, sel.Name, localPath, existing.Size(), existing.ModTime(), sel.Size, sel.ModTime)
+		if ans == overwriteNo || ans == overwriteNoAll || ans == overwriteCancel {
 			w.appendLog("Skipped: " + sel.Name)
 			return
 		}
 	}
-	w.startTransfer("download", sel.Name, localPath, remotePath, overwrite)
+	w.startTransferBatch("download", []transferItem{{localPath: localPath, remotePath: remotePath, display: sel.Name, size: sel.Size, srcModTime: sel.ModTime}}, nil)
 }
 
-func (w *sftpWin) startTransfer(dir, name, localPath, remotePath string, overwrite bool) {
+// startTransferBatch: jalankan antrean file satu per satu di goroutine
+// (2026-11-16, multi-file + folder). Satu file gagal TIDAK
+// menghentikan antrean — gagalnya dilog, file berikut tetap jalan
+// (seperti WinSCP). Cancel menghentikan antrean di file berikutnya.
+// Folder (dirs, termasuk folder kosong) dibuat dulu sebelum file.
+// Progress bar = file yang sedang berjalan; label = "Uploading i/N:
+// display ...". overwrite selalu true di sini: keputusan timpa sudah
+// diambil sebelum antrean jalan (dialog WinSCP per file).
+func (w *sftpWin) startTransferBatch(dir string, items []transferItem, dirs []string) {
+	if len(items) == 0 && len(dirs) == 0 {
+		return
+	}
 	w.transferInProg = true
 	w.transferDir = dir
-	w.transferName = name
+	w.transferItems = items
+	w.transferTotal = len(items)
+	w.transferIndex = 0
+	if len(items) > 0 {
+		w.transferName = items[0].display
+	} else {
+		w.transferName = ""
+	}
 	w.cancel.Store(false)
 	w.progressSent.Store(0)
 	w.progressTotal.Store(0)
@@ -762,8 +1022,16 @@ func (w *sftpWin) startTransfer(dir, name, localPath, remotePath string, overwri
 	if w.ctlProgress != 0 {
 		win.SendMessage(w.ctlProgress, win.PBM_SETPOS, 0, 0)
 	}
-	setText(w.ctlProgressLabel, dir+"ing "+name+" ...")
-	w.appendLog(capFirst(dir) + "ing: " + name)
+	if len(items) > 1 {
+		setText(w.ctlProgressLabel, fmt.Sprintf("%sing 1/%d: %s ...", dir, len(items), items[0].display))
+		w.appendLog(fmt.Sprintf("%sing %d files...", capFirst(dir), len(items)))
+	} else if len(items) == 1 {
+		setText(w.ctlProgressLabel, dir+"ing "+items[0].display+" ...")
+		w.appendLog(capFirst(dir) + "ing: " + items[0].display)
+	} else {
+		setText(w.ctlProgressLabel, "Creating folders ...")
+		w.appendLog(capFirst(dir) + "ing folders...")
+	}
 	hwnd := w.hwnd
 	client := w.client
 	cancel := &w.cancel
@@ -777,14 +1045,80 @@ func (w *sftpWin) startTransfer(dir, name, localPath, remotePath string, overwri
 		}
 	}
 	go func() {
-		var err error
-		if dir == "upload" {
-			err = UploadFile(client, localPath, remotePath, overwrite, cancel, onProgress)
-		} else {
-			err = DownloadFile(client, remotePath, localPath, overwrite, cancel, onProgress)
+		var failures []string
+		okCount, failedCount := 0, 0
+		// Buat folder dulu (termasuk folder kosong yang dipilih).
+		// Upload: MkdirAll remote; Download: MkdirAll lokal.
+		// Gagal membuat folder dilog, tapi file di dalamnya tetap
+		// dicoba (parent dibuat lagi per file di bawah).
+		for _, d := range dirs {
+			var err error
+			if dir == "upload" {
+				err = client.MkdirAll(d)
+			} else {
+				err = os.MkdirAll(d, 0o755)
+			}
+			if err != nil {
+				failures = append(failures, d+": "+err.Error())
+				failedCount++
+			}
 		}
-		postMessage(hwnd, wmAppSFTPDone, storeSFTPDone(&sftpDoneResult{name: name, dir: dir, err: err}), 0)
+		// Upload: parent remote per file, di-cache supaya MkdirAll
+		// tidak diulang untuk file se-folder (satu round-trip hemat).
+		createdRemoteDirs := map[string]bool{}
+		for i, it := range items {
+			if cancel.Load() {
+				postMessage(hwnd, wmAppSFTPDone, storeSFTPDone(&sftpDoneResult{name: batchDisplayName(items), dir: dir, err: ErrCancelled, total: len(items), okCount: okCount, failedCount: failedCount, failures: failures}), 0)
+				return
+			}
+			postMessage(hwnd, wmAppSFTPItem, uintptr(i+1), 0)
+			postMessage(hwnd, wmAppSFTPProgress, 0, uintptr(it.size))
+			var err error
+			if dir == "upload" {
+				parent := remoteParent(it.remotePath)
+				if parent != "" && parent != "." && !createdRemoteDirs[parent] {
+					if merr := client.MkdirAll(parent); merr != nil {
+						err = merr
+					} else {
+						createdRemoteDirs[parent] = true
+					}
+				}
+				if err == nil {
+					err = UploadFile(client, it.localPath, it.remotePath, true, cancel, onProgress)
+				}
+			} else {
+				if merr := os.MkdirAll(filepath.Dir(it.localPath), 0o755); merr != nil {
+					err = merr
+				} else {
+					err = DownloadFile(client, it.remotePath, it.localPath, true, cancel, onProgress)
+				}
+			}
+			if err == nil {
+				okCount++
+			} else if errors.Is(err, ErrCancelled) {
+				postMessage(hwnd, wmAppSFTPDone, storeSFTPDone(&sftpDoneResult{name: batchDisplayName(items), dir: dir, err: ErrCancelled, total: len(items), okCount: okCount, failedCount: failedCount, failures: failures}), 0)
+				return
+			} else {
+				failedCount++
+				failures = append(failures, it.display+": "+err.Error())
+			}
+		}
+		// Selesai (atau hanya folder yang dibuat): err nil, hasil
+		// dihitung dari okCount/failedCount di handler Done.
+		postMessage(hwnd, wmAppSFTPDone, storeSFTPDone(&sftpDoneResult{name: batchDisplayName(items), dir: dir, err: nil, total: len(items), okCount: okCount, failedCount: failedCount, failures: failures}), 0)
 	}()
+}
+
+// batchDisplayName: nama untuk label/log hasil batch — satu file =
+// nama filenya, banyak file = "N files", hanya folder = "folders".
+func batchDisplayName(items []transferItem) string {
+	if len(items) == 1 {
+		return items[0].display
+	}
+	if len(items) == 0 {
+		return "folders"
+	}
+	return fmt.Sprintf("%d files", len(items))
 }
 
 // sftpRunOp: jalankan operasi remote (rename/delete/newfolder) di
@@ -804,37 +1138,84 @@ func (w *sftpWin) sftpRunOp(op, name string, fn func(client *sftp.Client) error)
 	}()
 }
 
-// sftpDeleteSelected: hapus file/folder remote yang terpilih, dengan
-// konfirmasi detail (nama, ukuran, tanggal; folder harus kosong).
-// Dipakai bersama oleh klik kanan Delete DAN tombol Delete keyboard,
-// supaya perilakunya identik. ".." dan tanpa seleksi: tidak ada popup,
-// hanya log (untuk keyboard) atau tidak terjadi apa-apa (untuk menu,
-// item Delete memang tidak ditampilkan untuk "..").
+// sftpDeleteSelected: hapus SEMUA file/folder remote yang terpilih
+// (2026-11-16, multi-delete — pasangan multi-select Shift+klik /
+// Ctrl+klik / Ctrl+A). Satu dialog konfirmasi untuk seluruh batch
+// (deleteConfirmText, sftp.go); satu file gagal tidak menghentikan
+// yang lain, gagalnya diringkas di hasil op. Dipakai bersama oleh
+// klik kanan Delete DAN tombol Delete keyboard, supaya perilakunya
+// identik. ".." dan tanpa seleksi: tidak ada popup, hanya log (untuk
+// keyboard) atau tidak terjadi apa-apa (untuk menu, item Delete
+// memang tidak ditampilkan untuk ".."). Catatan: klik kanan memilih
+// dulu item yang diklik (seleksi lain dibersihkan), jadi Delete dari
+// menu tetap satu file; Delete dari keyboard / tombol menghapus semua
+// yang terpilih.
 func (w *sftpWin) sftpDeleteSelected() {
 	if !w.ready || w.client == nil || w.transferInProg {
 		return
 	}
-	sel := w.remoteSelection()
-	if sel == nil || sel.IsParent {
-		return
-	}
-	target := remoteJoin(w.remotePath, sel.Name)
-	var detail string
-	if sel.IsDir {
-		detail = "Delete this folder?\n" + target + "\n\nFolder must be empty.\nThis cannot be undone."
-	} else {
-		detail = "Delete this file?\n" + target + "\nSize: " + entrySizeText(*sel) + ", Changed: " + entryChangedText(*sel) + "\n\nThis cannot be undone."
-	}
-	if msgBox(w.hwnd, detail, "Delete", win.MB_YESNO|win.MB_ICONWARNING) != win.IDYES {
-		w.appendLog("Delete cancelled: " + sel.Name)
-		return
-	}
-	w.appendLog("Deleting: " + sel.Name)
-	w.sftpRunOp("delete", sel.Name, func(client *sftp.Client) error {
-		if sel.IsDir {
-			return client.RemoveDirectory(target)
+	var targets []SFTPEntry
+	for _, s := range w.remoteSelections() {
+		if !s.IsParent {
+			targets = append(targets, s)
 		}
-		return client.Remove(target)
+	}
+	if len(targets) == 0 {
+		return
+	}
+	detail := deleteConfirmText(targets, w.remotePath)
+	if msgBox(w.hwnd, detail, "Delete", win.MB_YESNO|win.MB_ICONWARNING) != win.IDYES {
+		if len(targets) == 1 {
+			w.appendLog("Delete cancelled: " + targets[0].Name)
+		} else {
+			w.appendLog(fmt.Sprintf("Delete cancelled: %d items", len(targets)))
+		}
+		return
+	}
+	// Path lengkap dihitung DI SINI (UI thread), bukan di goroutine:
+	// kalau user pindah folder selagi hapus jalan, w.remotePath sudah
+	// berubah dan path yang dihapus jadi salah.
+	type delTarget struct {
+		name, path string
+		isDir      bool
+	}
+	dels := make([]delTarget, 0, len(targets))
+	for _, s := range targets {
+		dels = append(dels, delTarget{name: s.Name, path: remoteJoin(w.remotePath, s.Name), isDir: s.IsDir})
+	}
+	name := targets[0].Name
+	if len(targets) > 1 {
+		name = fmt.Sprintf("%d items", len(targets))
+		w.appendLog(fmt.Sprintf("Deleting %d items...", len(targets)))
+	} else {
+		w.appendLog("Deleting: " + name)
+	}
+	w.sftpRunOp("delete", name, func(client *sftp.Client) error {
+		var failed []string
+		for _, d := range dels {
+			var err error
+			if d.isDir {
+				err = client.RemoveDirectory(d.path)
+			} else {
+				err = client.Remove(d.path)
+			}
+			if err != nil {
+				failed = append(failed, d.name+": "+err.Error())
+			}
+		}
+		if len(failed) == 0 {
+			return nil
+		}
+		// Ringkas: berapa gagal + contoh pertama (max 3 baris).
+		msg := fmt.Sprintf("%d of %d failed", len(failed), len(dels))
+		n := len(failed)
+		if n > 3 {
+			n = 3
+		}
+		for i := 0; i < n; i++ {
+			msg += "\n" + failed[i]
+		}
+		return errors.New(msg)
 	})
 }
 
@@ -856,6 +1237,19 @@ func (w *sftpWin) sftpShowRemoteMenu(screenX, screenY int32) {
 	selIdx := -1
 	if hit.IItem >= 0 {
 		selIdx = int(hit.IItem)
+		// Bersihkan seleksi lain dulu: Rename/Delete hanya berlaku
+		// untuk item yang diklik kanan (penting sejak multi-select
+		// aktif — kalau tidak, Delete bisa menghapus seleksi pertama
+		// yang bukan item ini).
+		idx := -1
+		for {
+			idx = int(win.SendMessage(w.ctlRemoteList, win.LVM_GETNEXTITEM, uintptr(idx), uintptr(win.LVNI_SELECTED)))
+			if idx < 0 {
+				break
+			}
+			clearIt := win.LVITEM{State: 0, StateMask: win.LVIS_SELECTED}
+			win.SendMessage(w.ctlRemoteList, win.LVM_SETITEMSTATE, uintptr(idx), uintptr(unsafe.Pointer(&clearIt)))
+		}
 		// Pilih item yang diklik kanan.
 		it := win.LVITEM{State: win.LVIS_SELECTED, StateMask: win.LVIS_SELECTED}
 		win.SendMessage(w.ctlRemoteList, win.LVM_SETITEMSTATE, uintptr(hit.IItem), uintptr(unsafe.Pointer(&it)))
@@ -927,6 +1321,24 @@ func sftpListWndProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr) uintptr 
 		return win.DefWindowProc(hwnd, msg, wParam, lParam)
 	}
 	res := win.CallWindowProc(orig, hwnd, msg, wParam, lParam)
+	// Ctrl+A di list = pilih semua item (2026-11-16, pasangan
+	// multi-select Shift+klik / Ctrl+klik). ListView tidak punya
+	// Ctrl+A bawaan, jadi ditangani di sini.
+	if w != nil && msg == win.WM_KEYDOWN && wParam == 0x41 && // 'A'
+		win.GetKeyState(win.VK_CONTROL) < 0 {
+		// LVM_GETITEMCOUNT tidak ada di lxn/win, jadi iterasi
+		// semua item lewat LVM_GETNEXTITEM + LVNI_ALL.
+		idx := -1
+		for {
+			idx = int(win.SendMessage(hwnd, win.LVM_GETNEXTITEM, uintptr(idx), uintptr(win.LVNI_ALL)))
+			if idx < 0 {
+				break
+			}
+			it := win.LVITEM{State: win.LVIS_SELECTED, StateMask: win.LVIS_SELECTED}
+			win.SendMessage(hwnd, win.LVM_SETITEMSTATE, uintptr(idx), uintptr(unsafe.Pointer(&it)))
+		}
+		return res
+	}
 	if w != nil && (msg == win.WM_LBUTTONDBLCLK ||
 		// Enter di list (setelah pilih pakai Up/Down) = sama seperti
 		// double-click: folder = masuk, file = transfer, ".." = kembali.
@@ -940,6 +1352,18 @@ func sftpListWndProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr) uintptr 
 	if w != nil && hwnd == w.ctlRemoteList &&
 		msg == win.WM_KEYDOWN && wParam == win.VK_DELETE {
 		postMessage(parent, wmAppSFTPDeleteKey, 0, 0)
+	}
+	// Backspace di list = kembali ke folder atas (2026-11-16):
+	// sama seperti tombol Up panel itu. Pasangan Enter (masuk
+	// folder). Backspace di Edit path tetap menghapus karakter,
+	// karena Edit bukan ListView dan tidak lewat subclass ini.
+	// Selama transfer, navigasi dimatikan seperti tombol Up.
+	if w != nil && msg == win.WM_KEYDOWN && wParam == win.VK_BACK && !w.transferInProg {
+		if hwnd == w.ctlLocalList {
+			w.refreshLocal(localParent(strings.TrimSpace(getText(w.ctlLocalPath))))
+		} else if hwnd == w.ctlRemoteList && w.ready {
+			w.refreshRemote(remoteParent(strings.TrimSpace(getText(w.ctlRemotePath))))
+		}
 	}
 	return res
 }
@@ -987,19 +1411,26 @@ func sftpWndProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr) uintptr {
 		// ulang semuanya mengikuti ukuran jendela sebenarnya.
 		createControl("STATIC", "", 0, 0, 0, 1200, 64, hwnd, sftpIdHeaderBanner)
 		createControl("STATIC", "KERM Terminal - SFTP", 0, 16, 8, 400, 30, hwnd, sftpIdHeaderTitle)
-		createControl("STATIC", "Local (left)  |  Remote (right)  —  Double-click / Enter: folder = enter, local file = upload, remote text file = edit (save uploads back), other remote file = download.", 0, 16, 36, 1168, 20, hwnd, sftpIdHeaderSub)
+		createControl("STATIC", "Local (left)  |  Remote (right)  —  Double-click / Enter: folder = enter, local file = upload, remote text file = edit (save uploads back), other remote file = download.  Backspace: parent folder.  Shift+click / Ctrl+click: select multiple, Ctrl+A: select all — Upload / Download transfers all selected, folders included.", 0, 16, 36, 1168, 20, hwnd, sftpIdHeaderSub)
 		// Baris path per panel (gaya WinSCP: path di atas daftarnya
 		// masing-masing, bukan dua baris full-width). Posisi awal
 		// di sini hanya placeholder, layoutSFTP yang menata final.
 		w.ctlLocalPath = createControl("EDIT", w.localPath, win.WS_BORDER|win.ES_AUTOHSCROLL, 16, 72, 414, 22, hwnd, sftpIdLocalPath)
 		createControl("BUTTON", "Up", 0, 438, 72, 50, 24, hwnd, sftpIdLocalUp)
 		createControl("BUTTON", "Refresh", 0, 496, 72, 64, 24, hwnd, sftpIdLocalRefresh)
+		// Tombol Browse folder lokal (2026-11-16): dialog pilih folder
+		// Windows, supaya bisa explore ke folder mana pun tanpa
+		// mengetik path. Hanya panel lokal (folder remote ada di server).
+		createControl("BUTTON", "📁 Browse", 0, 568, 72, 96, 24, hwnd, sftpIdLocalBrowse)
 		w.ctlRemotePath = createControl("EDIT", "Connecting SFTP...", win.WS_BORDER|win.ES_AUTOHSCROLL, 640, 72, 414, 22, hwnd, sftpIdRemotePath)
 		createControl("BUTTON", "Up", 0, 1062, 72, 50, 24, hwnd, sftpIdRemoteUp)
 		createControl("BUTTON", "Refresh", 0, 1120, 72, 64, 24, hwnd, sftpIdRemoteRefresh)
 		// Dua ListView kolom (gaya WinSCP) + tombol tengah.
-		w.ctlLocalList = createControl("SysListView32", "", win.WS_BORDER|win.WS_VSCROLL|win.LVS_REPORT|win.LVS_SINGLESEL|win.LVS_SHOWSELALWAYS, 16, 104, 544, 476, hwnd, sftpIdLocalList)
-		w.ctlRemoteList = createControl("SysListView32", "", win.WS_BORDER|win.WS_VSCROLL|win.LVS_REPORT|win.LVS_SINGLESEL|win.LVS_SHOWSELALWAYS, 640, 104, 544, 476, hwnd, sftpIdRemoteList)
+		// TANPA LVS_SINGLESEL (2026-11-16): multi-select aktif —
+		// Shift+klik = rentang, Ctrl+klik = tambah/lepas satu,
+		// Ctrl+A = pilih semua (ditangani subclass ListView).
+		w.ctlLocalList = createControl("SysListView32", "", win.WS_BORDER|win.WS_VSCROLL|win.LVS_REPORT|win.LVS_SHOWSELALWAYS, 16, 104, 544, 476, hwnd, sftpIdLocalList)
+		w.ctlRemoteList = createControl("SysListView32", "", win.WS_BORDER|win.WS_VSCROLL|win.LVS_REPORT|win.LVS_SHOWSELALWAYS, 640, 104, 544, 476, hwnd, sftpIdRemoteList)
 		sftpSetupListView(w.ctlLocalList)
 		sftpSetupListView(w.ctlRemoteList)
 		w.localListOrig = win.SetWindowLongPtr(w.ctlLocalList, win.GWLP_WNDPROC, sftpListProc)
@@ -1023,7 +1454,7 @@ func sftpWndProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr) uintptr {
 		}
 		// Tab order = urutan pembuatan kontrol interaktif.
 		w.tabControls = []win.HWND{
-			w.ctlLocalPath, win.GetDlgItem(hwnd, sftpIdLocalUp), win.GetDlgItem(hwnd, sftpIdLocalRefresh),
+			w.ctlLocalPath, win.GetDlgItem(hwnd, sftpIdLocalUp), win.GetDlgItem(hwnd, sftpIdLocalRefresh), win.GetDlgItem(hwnd, sftpIdLocalBrowse),
 			w.ctlRemotePath, win.GetDlgItem(hwnd, sftpIdRemoteUp), win.GetDlgItem(hwnd, sftpIdRemoteRefresh),
 			w.ctlLocalList, w.ctlRemoteList, w.ctlUpload, w.ctlDownload, w.ctlCancel,
 		}
@@ -1150,7 +1581,29 @@ func sftpWndProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr) uintptr {
 		if w.ctlProgress != 0 {
 			win.SendMessage(w.ctlProgress, win.PBM_SETPOS, uintptr(pct), 0)
 		}
-		setText(w.ctlProgressLabel, fmt.Sprintf("%sing %s ... %d%% (%s / %s)", w.transferDir, w.transferName, pct, formatSize(sent), formatSize(total)))
+		if w.transferTotal > 1 {
+			setText(w.ctlProgressLabel, fmt.Sprintf("%sing %d/%d: %s ... %d%% (%s / %s)", w.transferDir, w.transferIndex, w.transferTotal, w.transferName, pct, formatSize(sent), formatSize(total)))
+		} else {
+			setText(w.ctlProgressLabel, fmt.Sprintf("%sing %s ... %d%% (%s / %s)", w.transferDir, w.transferName, pct, formatSize(sent), formatSize(total)))
+		}
+		return 0
+	case wmAppSFTPItem:
+		// Goroutine transfer: file ke-i mulai. UI thread yang
+		// mengisi transferName/transferIndex (bukan goroutine),
+		// supaya tidak ada data race dengan handler progress.
+		if w == nil {
+			return 0
+		}
+		idx := int(wParam)
+		if idx >= 1 && idx <= len(w.transferItems) {
+			w.transferIndex = idx
+			w.transferName = w.transferItems[idx-1].display
+			if w.transferTotal > 1 {
+				setText(w.ctlProgressLabel, fmt.Sprintf("%sing %d/%d: %s ...", w.transferDir, idx, w.transferTotal, w.transferName))
+			} else {
+				setText(w.ctlProgressLabel, w.transferDir+"ing "+w.transferName+" ...")
+			}
+		}
 		return 0
 	case wmAppSFTPDone:
 		if w == nil {
@@ -1163,21 +1616,37 @@ func sftpWndProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr) uintptr {
 		w.transferInProg = false
 		w.setTransferEnabled(true)
 		if w.ctlProgress != 0 {
-			if res.err == nil {
+			if res.err == nil && res.failedCount == 0 {
 				win.SendMessage(w.ctlProgress, win.PBM_SETPOS, 100, 0)
 			} else {
 				win.SendMessage(w.ctlProgress, win.PBM_SETPOS, 0, 0)
 			}
 		}
-		if res.err == nil {
+		// Batch (2026-11-16): satu file gagal tidak menggagalkan
+		// antrean, jadi hasil dibaca dari okCount/failedCount, bukan
+		// dari res.err saja (err hanya dipakai untuk Cancel).
+		if errors.Is(res.err, ErrCancelled) {
+			if res.total > 1 {
+				setText(w.ctlProgressLabel, fmt.Sprintf("Cancelled: %d of %d files", res.okCount, res.total))
+				w.appendLog(fmt.Sprintf("Cancelled: %d of %d files %sed (partial file removed)", res.okCount, res.total, res.dir))
+			} else {
+				setText(w.ctlProgressLabel, "Cancelled: "+res.name)
+				w.appendLog("Cancelled: " + res.name + " (partial file removed)")
+			}
+		} else if res.failedCount > 0 {
+			if res.total > 1 {
+				setText(w.ctlProgressLabel, fmt.Sprintf("%s finished with errors: %d of %d files, %d failed", capFirst(res.dir), res.okCount, res.total, res.failedCount))
+				w.appendLog(fmt.Sprintf("%s finished with errors: %d of %d files, %d failed", capFirst(res.dir), res.okCount, res.total, res.failedCount))
+			} else {
+				setText(w.ctlProgressLabel, "Failed: "+res.name)
+				w.appendLog("Failed: " + res.name)
+			}
+		} else {
 			setText(w.ctlProgressLabel, capFirst(res.dir)+" finished: "+res.name)
 			w.appendLog(capFirst(res.dir) + " finished: " + res.name)
-		} else if errors.Is(res.err, ErrCancelled) {
-			setText(w.ctlProgressLabel, "Cancelled: "+res.name)
-			w.appendLog("Cancelled: " + res.name + " (partial file removed)")
-		} else {
-			setText(w.ctlProgressLabel, "Failed: "+res.name)
-			w.appendLog("Failed: " + res.name + ": " + res.err.Error())
+		}
+		for _, f := range res.failures {
+			w.appendLog("Failed: " + f)
 		}
 		// Daftar diperbarui supaya file baru / perubahan terlihat.
 		w.refreshLocal(w.localPath)
@@ -1199,6 +1668,15 @@ func sftpWndProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr) uintptr {
 		case sftpIdLocalRefresh:
 			if code == win.BN_CLICKED && !w.transferInProg {
 				w.refreshLocal(strings.TrimSpace(getText(w.ctlLocalPath)))
+			}
+		case sftpIdLocalBrowse:
+			// Tombol 📁 Browse: dialog pilih folder Windows, dibuka
+			// di folder lokal saat ini; folder yang dipilih langsung
+			// dibuka di panel lokal.
+			if code == win.BN_CLICKED && !w.transferInProg {
+				if dir := browseLocalFolder(w.hwnd, w.localPath); dir != "" {
+					w.refreshLocal(dir)
+				}
 			}
 		case sftpIdRemoteUp:
 			if code == win.BN_CLICKED && w.ready && !w.transferInProg {
@@ -1249,7 +1727,10 @@ func sftpWndProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr) uintptr {
 					} else if sel.IsDir {
 						w.refreshLocal(localJoin(w.localPath, sel.Name))
 					} else {
-						w.startUpload()
+						// Double-click = hanya file yang diklik,
+						// bukan semua yang terpilih (tombol Upload
+						// yang mentransfer semua seleksi).
+						w.startUploadOne(*sel)
 					}
 				}
 			} else if win.HWND(wParam) == w.ctlRemoteList && w.ready && !w.transferInProg {
@@ -1260,8 +1741,10 @@ func sftpWndProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr) uintptr {
 						w.refreshRemote(remoteJoin(w.remotePath, sel.Name))
 					} else if isKnownBinaryExt(filepath.Ext(sel.Name)) {
 						// File biner yang sudah dikenal: Enter /
-						// double-click tetap download (perilaku lama).
-						w.startDownload()
+						// double-click tetap download satu file ini
+						// (perilaku lama; tombol Download yang
+						// mengunduh semua seleksi).
+						w.startDownloadOne(*sel)
 					} else {
 						// File teks (json, conf, txt, dll, plus
 						// ekstensi tak dikenal yang ternyata teks

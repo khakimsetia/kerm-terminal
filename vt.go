@@ -291,19 +291,37 @@ func (t *Term) AltActive() bool { return t.altActive }
 // LinesForView returns Rows lines for a given scroll offset.
 // offset 0 = live screen; offset > 0 = scrolled up into scrollback.
 // Alt screen has no scrollback.
+//
+// Baris yang dikembalikan adalah REFERENSI ke baris di scrollback /
+// buffer, bukan salinan — pemanggil hanya boleh membaca, tidak
+// mengubahnya (paint dan seleksi hanya membaca).
+//
+// PENTING (bug 2026-11-13): dulu fungsi ini menyalin SELURUH
+// scrollback ke satu slice baru di setiap panggilan
+// (O(scrollback) per repaint). Begitu scrollback tanpa batas dan
+// output panjang (puluhan ribu baris), setiap repaint menyalin
+// jutaan byte — itulah jeda saat cat file panjang: semua output
+// sudah masuk, tapi UI masih sibuk menyalin scrollback sebelum
+// prompt root@ sempat digambar. Sekarang indeks langsung ke
+// scrollback/buf, O(Rows) saja, tanpa menyalin apa pun.
 func (t *Term) LinesForView(offset int) [][]Cell {
 	if t.altActive || offset <= 0 {
 		return t.curBuf()
 	}
-	total := append(append([][]Cell{}, t.scrollback...), t.buf...)
 	if offset > len(t.scrollback) {
 		offset = len(t.scrollback)
 	}
-	start := len(total) - t.Rows - offset
+	// Baris pertama yang terlihat = scrollback[len(sb)-offset].
+	// (Rumus lama: len(total)-Rows-offset, dengan total = sb+Rows,
+	// hasilnya sama: sb-offset.)
+	start := len(t.scrollback) - offset
 	out := make([][]Cell, t.Rows)
 	for i := 0; i < t.Rows; i++ {
-		if start+i >= 0 && start+i < len(total) {
-			out[i] = total[start+i]
+		idx := start + i
+		if idx < len(t.scrollback) {
+			out[i] = t.scrollback[idx]
+		} else if idx-len(t.scrollback) < len(t.buf) {
+			out[i] = t.buf[idx-len(t.scrollback)]
 		} else {
 			out[i] = blankLine(t.Cols)
 		}
@@ -318,10 +336,23 @@ func (t *Term) scrollUp(n int) {
 	buf := t.curBuf()
 	for i := 0; i < n; i++ {
 		if !t.altActive && t.top == 0 && t.bottom == t.Rows-1 {
+			// Scrollback TANPA BATAS (2026-11-13, atas permintaan
+			// user): dulu dibatasi 2000 baris, lalu sempat 10000,
+			// tapi output yang panjang sekali tetap kehilangan
+			// baris paling atas. Sekarang baris lama tidak pernah
+			// dibuang, jadi Shift+Home selalu sampai ke baris
+			// pertama sesi. Risikonya: output yang jalan terus
+			// tanpa henti (jutaan baris) akan memakan RAM terus —
+			// kira-kira 1,6 KB per baris di 80 kolom — jadi untuk
+			// output sebesar itu lebih aman redirect ke file
+			// atau pakai less/head di server.
 			t.scrollback = append(t.scrollback, append([]Cell{}, buf[0]...))
 		}
 		copy(buf[t.top:t.bottom], buf[t.top+1:t.bottom+1])
 		buf[t.bottom] = blankLine(t.Cols)
+		// Baris logis yang terpotong ikut bergeser ke atas bersama
+		// buffer; kalau baris pertamanya keluar dari region (scroll
+		// off), pelacakan wrap tidak lagi valid.
 		if t.wrapStartY >= t.top && t.wrapStartY <= t.bottom {
 			t.wrapStartY--
 			if t.wrapStartY < t.top {

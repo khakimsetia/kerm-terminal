@@ -6,8 +6,9 @@
 //   - download file server -> lokal,
 //   - cek timpa sebelum menulis (tidak pernah timpa diam-diam).
 //
-// Bukan fitur: transfer direktori rekursif, rename/delete/mkdir/chmod,
-// resume. Itu tambahan nanti kalau diminta.
+// Bukan fitur: rename/delete/mkdir/chmod, resume. Transfer folder
+// rekursif + multi-file ditambahkan 2026-11-16 (lihat collectLocalFiles
+// / collectRemoteFiles dan antrean batch di sftp_ui.go).
 //
 // Arsitektur: mesin ini murni Go, tanpa Win32, supaya bisa di-test di
 // Linux. UI Win32 (sftp_ui.go) hanya memanggil fungsi di sini dan
@@ -395,6 +396,215 @@ func DownloadFile(client *sftp.Client, remotePath, localPath string, overwrite b
 		return copyErr
 	}
 	return closeErr
+}
+
+// transferItem: satu file dalam antrean transfer batch. display
+// adalah path relatif dari akar yang dipilih (mis. "toko/index.html"
+// atau "file.txt") — dipakai label progress + log, supaya jelas file
+// mana yang sedang ditransfer saat upload folder / multi-file.
+// size + srcModTime = file SUMBER (yang ditransfer); dipakai dialog
+// timpa WinSCP sebagai sisi "New".
+type transferItem struct {
+	localPath  string
+	remotePath string
+	display    string
+	size       int64
+	srcModTime time.Time
+}
+
+// overwriteDecision: jawaban dialog timpa gaya WinSCP (2026-11-16).
+// Yes/No = file ini saja; Yes to All / No to All = file ini DAN
+// semua file berikut yang sudah ada; Cancel = batalkan seluruh
+// transfer. Sengaja TANPA Newer only / New name (permintaan user).
+type overwriteDecision int
+
+const (
+	overwriteYes overwriteDecision = iota
+	overwriteNo
+	overwriteYesAll
+	overwriteNoAll
+	overwriteCancel
+)
+
+// applyOverwriteDecisions: terapkan jawaban dialog timpa (WinSCP) ke
+// antrean. existing[i] = items[i] sudah ada di tujuan. ask dipanggil
+// untuk tiap file yang sudah ada, KECUALI setelah jawaban "to All"
+// (keputusan itu berlaku untuk semua file berikut yang sudah ada).
+// Kembalikan antrean final + false kalau Cancel (batalkan seluruh
+// transfer). Murni Go, ter-test — dialog Win32-nya hanya memanggil
+// ini lewat ask (lihat confirmBatchOverwrite di sftp_ui.go).
+func applyOverwriteDecisions(items []transferItem, existing []bool, ask func(item transferItem) overwriteDecision) ([]transferItem, bool) {
+	var kept []transferItem
+	var sticky *overwriteDecision // nil = belum ada keputusan "to All"
+	for i, it := range items {
+		if i >= len(existing) || !existing[i] {
+			kept = append(kept, it)
+			continue
+		}
+		var ans overwriteDecision
+		if sticky != nil {
+			ans = *sticky
+		} else {
+			ans = ask(it)
+		}
+		switch ans {
+		case overwriteYes:
+			kept = append(kept, it)
+		case overwriteNo:
+			// Lewati file ini saja.
+		case overwriteYesAll:
+			y := overwriteYesAll
+			sticky = &y
+			kept = append(kept, it)
+		case overwriteNoAll:
+			n := overwriteNoAll
+			sticky = &n
+			// Lewati file ini dan semua berikut yang sudah ada.
+		case overwriteCancel:
+			return nil, false
+		}
+	}
+	return kept, true
+}
+
+// overwriteDialogText: teks dialog timpa WinSCP — ukuran + tanggal
+// kedua sisi (New = file sumber, Existing = file tujuan). Murni, ter-test.
+func overwriteDialogText(name, target string, existingSize int64, existingTime time.Time, newSize int64, newTime time.Time) string {
+	return fmt.Sprintf("File already exists:\n%s\n\nExisting: %s, %s\nNew: %s, %s\n\nOverwrite?",
+		target, formatSize(existingSize), existingTime.Format("2006-01-02 15:04"),
+		formatSize(newSize), newTime.Format("2006-01-02 15:04"))
+}
+
+// collectLocalFiles: kumpulkan SEMUA file di bawah localDir secara
+// rekursif, beserta daftar direktori (termasuk yang kosong, supaya
+// folder kosong tetap dibuat di server). Struktur folder dipertahankan:
+// file localDir/sub/a.txt -> remoteDir/sub/a.txt. Symlink ke direktori
+// dilewati (tidak diikuti, supaya tidak ada loop); symlink ke file
+// diikutkan sebagai file (isinya yang di-upload).
+// Dipakai Upload saat yang dipilih adalah folder.
+func collectLocalFiles(localDir, remoteDir string) (items []transferItem, dirs []string, err error) {
+	err = filepath.WalkDir(localDir, func(p string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		rel, rerr := filepath.Rel(localDir, p)
+		if rerr != nil {
+			return rerr
+		}
+		if rel == "." {
+			return nil
+		}
+		// Path remote selalu pakai "/", jadi rel Windows (\) diubah dulu.
+		relSlash := filepath.ToSlash(rel)
+		if d.IsDir() {
+			dirs = append(dirs, remoteJoin(remoteDir, relSlash))
+			return nil
+		}
+		// Symlink ke direktori: jangan diikuti, jangan di-upload
+		// sebagai file (Open akan membaca direktori dan gagal).
+		if info, serr := os.Stat(p); serr == nil && info.IsDir() {
+			return nil
+		}
+		info, serr := d.Info()
+		if serr != nil {
+			return serr
+		}
+		items = append(items, transferItem{
+			localPath:  p,
+			remotePath: remoteJoin(remoteDir, relSlash),
+			display:    relSlash,
+			size:       info.Size(),
+			srcModTime: info.ModTime(),
+		})
+		return nil
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return items, dirs, nil
+}
+
+// collectRemoteFiles: kumpulkan SEMUA file di bawah remoteDir secara
+// rekursif (cerminan collectLocalFiles untuk Download). readDir
+// disuntikkan (client.ReadDir) supaya bisa di-test dengan filesystem
+// palsu — lihat collectRemoteFilesWith.
+func collectRemoteFiles(client *sftp.Client, remoteDir, localDir string) ([]transferItem, []string, error) {
+	return collectRemoteFilesWith(client.ReadDir, remoteDir, localDir)
+}
+
+// collectRemoteFilesWith: versi collectRemoteFiles yang readDir-nya
+// bisa diganti. dirs berisi path lokal direktori yang harus dibuat
+// (termasuk yang kosong).
+func collectRemoteFilesWith(readDir func(string) ([]os.FileInfo, error), remoteDir, localDir string) ([]transferItem, []string, error) {
+	var items []transferItem
+	var dirs []string
+	var walk func(rDir, lDir string) error
+	walk = func(rDir, lDir string) error {
+		infos, err := readDir(rDir)
+		if err != nil {
+			return err
+		}
+		for _, info := range infos {
+			if info.IsDir() {
+				lSub := filepath.Join(lDir, info.Name())
+				dirs = append(dirs, lSub)
+				if err := walk(remoteJoin(rDir, info.Name()), lSub); err != nil {
+					return err
+				}
+				continue
+			}
+			rel, rerr := filepath.Rel(localDir, filepath.Join(lDir, info.Name()))
+			if rerr != nil {
+				return rerr
+			}
+			items = append(items, transferItem{
+				localPath:  filepath.Join(lDir, info.Name()),
+				remotePath: remoteJoin(rDir, info.Name()),
+				display:    filepath.ToSlash(rel),
+				size:       info.Size(),
+				srcModTime: info.ModTime(),
+			})
+		}
+		return nil
+	}
+	if err := walk(remoteDir, localDir); err != nil {
+		return nil, nil, err
+	}
+	return items, dirs, nil
+}
+
+// deleteConfirmText: teks dialog konfirmasi hapus (murni, ter-test).
+// Satu item = detail ukuran/tanggal seperti dulu; banyak item =
+// daftar nama (max 5 + "+N more"), folder ditandai "/".
+// Dipakai sftpDeleteSelected untuk hapus satu file maupun banyak file
+// sekaligus (2026-11-16, pasangan multi-select Shift+klik / Ctrl+A).
+func deleteConfirmText(targets []SFTPEntry, remotePath string) string {
+	if len(targets) == 1 {
+		sel := targets[0]
+		target := remoteJoin(remotePath, sel.Name)
+		if sel.IsDir {
+			return "Delete this folder?\n" + target + "\n\nFolder must be empty.\nThis cannot be undone."
+		}
+		return "Delete this file?\n" + target + "\nSize: " + entrySizeText(sel) + ", Changed: " + entryChangedText(sel) + "\n\nThis cannot be undone."
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "Delete %d items?\n", len(targets))
+	n := len(targets)
+	if n > 5 {
+		n = 5
+	}
+	for i := 0; i < n; i++ {
+		b.WriteString(targets[i].Name)
+		if targets[i].IsDir {
+			b.WriteString("/")
+		}
+		b.WriteString("\n")
+	}
+	if len(targets) > 5 {
+		fmt.Fprintf(&b, "...and %d more\n", len(targets)-5)
+	}
+	b.WriteString("\nFolders must be empty.\nThis cannot be undone.")
+	return b.String()
 }
 
 // localJoin: gabung direktori lokal + nama (separator Windows di PC).

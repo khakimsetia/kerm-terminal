@@ -1,9 +1,10 @@
 # KERM Terminal
 
 Aplikasi terminal SSH & Telnet untuk Windows, ala PuTTY, dibuat dengan
-Go + Win32 murni tanpa runtime tambahan.
-Satu file `.exe`, portable: extract lalu jalankan.
+Go + Win32 murni — bukan aplikasi web, bukan browser, tanpa server lokal,
+tanpa runtime tambahan. Satu file `.exe`, portable: extract lalu jalankan.
 
+> Status: aplikasi ini dipakai sehari-hari oleh pembuatnya di Windows 64-bit.
 > Build ini **unsigned**, jadi Windows SmartScreen bisa muncul saat pertama
 > kali dijalankan. Lihat bagian [Keamanan](#keamanan).
 
@@ -15,11 +16,16 @@ Satu file `.exe`, portable: extract lalu jalankan.
 ![Terminal](screenshots/terminal.png)
 ![SFTP](screenshots/sftp.png)
 
+> Cara menambah screenshot: ambil screenshot di Windows (Snipping Tool
+> atau `Win+Shift+S`), simpan sebagai `panel.png`, `terminal.png`, dan
+> `sftp.png` di folder `screenshots/` di repo ini, lalu commit. GitHub
+> akan menampilkan ketiganya di atas secara otomatis. Kalau file-nya
+> belum ada, gambar di atas akan tampil rusak — itu normal sampai
+> screenshot-nya ditambahkan.
+
 ## Fitur
 
 - **SSH** ke server apa pun (VPS, localhost, LAN) dengan password atau key.
-- **Prompt hijau khas KERM**: `user@host` hijau dan direktori biru, diwarnai
-  di sisi klien tanpa mengubah PS1 server, jadi tidak ada prompt ganda.
 - **Key langsung, tanpa konversi**: file `.ppk` PuTTY v2/v3 (RSA, ECDSA,
   Ed25519, plain maupun passphrase Argon2id/Argon2i) dan key OpenSSH/`.pem`
   bisa dipakai langsung. Argon2d, DSA, dan Ed448 belum didukung.
@@ -31,6 +37,8 @@ Satu file `.exe`, portable: extract lalu jalankan.
 - **Banyak terminal, satu panel**: satu proses, satu panel sesi, banyak
   jendela terminal. Tutup panel saat terminal jalan hanya menyembunyikan
   panel; tutup satu terminal menampilkan panel lagi, terminal lain tetap jalan.
+- **Prompt hijau khas KERM**: `user@host` hijau dan direktori biru, diwarnai
+  di sisi klien tanpa mengubah PS1 server, jadi tidak ada prompt ganda.
 - **Terminal lengkap untuk pemakaian sehari-hari**: warna PuTTY, layar
   alternatif (vim, nano, htop, tmux), scrollback tanpa batas, scroll dengan
   roda mouse / Shift+PgUp / Shift+PgDn / Shift+Home / Shift+End, seleksi
@@ -45,14 +53,23 @@ Satu file `.exe`, portable: extract lalu jalankan.
   (tidak pernah menimpa diam-diam), rename, hapus (dengan konfirmasi),
   buat folder baru, tombol Delete di panel server, dan pemilih terminal
   kalau ada lebih dari satu terminal SSH terhubung.
+- **SFTP multi-file + folder** (2026-11-16): pilih banyak file dengan
+  Shift+klik (rentang), Ctrl+klik (tambah/lepas), atau Ctrl+A (pilih semua),
+  lalu tombol `Upload >>` / `<< Download` mentransfer semuanya sekaligus.
+  Folder ikut ter-upload / ter-download beserta seluruh isinya (rekursif,
+  struktur folder dipertahankan, folder kosong ikut dibuat). Kalau ada file
+  yang sudah ada di tujuan, ditanya per file gaya WinSCP: dialog menampilkan
+  ukuran + tanggal file baru vs yang sudah ada, dengan tombol Yes (timpa
+  file ini), No (lewati file ini), Yes to All (timpa file ini dan semua
+  berikut), No to All (lewati semua berikut), Cancel (batalkan semua).
+  Satu file gagal tidak menghentikan antrean — gagalnya dilog, file berikut
+  tetap jalan. Double-click / Enter tetap mentransfer satu file yang
+  diklik saja.
 - **Edit file server di editor teks**: Enter / double-click file teks di
   panel server (json, conf, txt, dan sejenisnya) membukanya di Notepad++
   (kalau ada) atau Notepad. Setiap Save di editor langsung di-upload balik
   ke server. File biner tetap di-download biasa, bukan dibuka di editor.
-- **Notifikasi gagal connect**: kalau server timeout (10 detik) atau tidak
-  terhubung, muncul popup simpel — judul "Connection Timeout" dan satu baris
-  "Error connect SSH failed: host:port i/o timeout" — bukan cuma satu baris
-  di status log.
+- **Notifikasi gagal connect**: kalau server timeout (10 detik) atau tidak terhubung, muncul popup simpel — judul "Connection Timeout" dan satu baris "Error connect SSH failed: host:port i/o timeout" — bukan cuma satu baris di status log.
 - **Pemberitahuan putus koneksi**: putus yang tidak normal (jaringan putus,
   laptop sleep, server restart) tidak membuat terminal hilang diam-diam —
   terminal tetap terbuka dengan keterangan putusnya, dan masih bisa
@@ -78,8 +95,12 @@ Jalan pintas penting:
 | Buka SFTP untuk terminal ini | `Ctrl+Shift+S` di terminal |
 | Buka SFTP dari panel | Tombol `SFTP` di bawah status log |
 | SFTP: masuk folder / upload / edit / download | Double-click atau Enter di list |
+| SFTP: pilih banyak file | Shift+klik (rentang), Ctrl+klik, atau Ctrl+A |
+| SFTP: upload / download banyak file atau folder | Pilih, lalu tombol `Upload >>` / `<< Download` |
 | SFTP: path langsung (mis. `D:\node`) | Ketik di kolom path, tekan Enter |
-| SFTP: hapus file server | Klik kanan → Delete, atau tombol Delete |
+| SFTP: pilih folder lokal | Tombol 📁 Browse di panel lokal (sebelah Refresh) |
+| SFTP: kembali ke folder atas | Backspace (di daftar file, panel lokal maupun remote) |
+| SFTP: hapus file server | Pilih (Shift+klik / Ctrl+klik / Ctrl+A), lalu klik kanan → Delete, atau tombol Delete — menghapus semua yang terpilih, satu dialog konfirmasi |
 | SFTP: rename / folder baru | Klik kanan di panel server |
 | Panel sesi dari terminal | `Ctrl+Shift+N` di terminal |
 
@@ -157,8 +178,7 @@ versi ini): port forwarding, X11/agent forwarding, jump host/proxy,
 Serial/Raw, pembuatan/konversi key (pakai PuTTYgen untuk itu), log sesi ke
 file, fullscreen Alt+Enter, dan pengaturan font/warna/scrollback di UI.
 Emoji / karakter CJK lebar dihitung 1 sel, jadi kursor bisa bergeser di
-baris yang banyak emojinya. SFTP tidak transfer folder rekursif (folder
-hanya untuk navigasi, file satu per satu).
+baris yang banyak emojinya.
 
 ## Lisensi
 
